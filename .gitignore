@@ -1,3 +1,5 @@
 /target
 users.txt
 curious.pgn
+# saved games created by the interactive app
+*.pgn

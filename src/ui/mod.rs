@@ -56,6 +56,119 @@ pub mod colors {
 }
 
 // ============================================================================
+// TERMINAL TEXT METRICS
+// ============================================================================
+
+/// Total rendered width of every boxed UI panel, borders included. All
+/// panels (header, game info, analysis, commands, notifications) share this
+/// width so their vertical borders line up on screen.
+pub const PANEL_WIDTH: usize = 67;
+
+pub mod text {
+    //! Display-width aware string helpers.
+    //!
+    //! `str::len()` counts bytes, so padding computed from it breaks the box
+    //! borders as soon as a line contains ANSI color codes (0 columns) or
+    //! emoji (2 columns). Everything rendered inside a bordered panel must be
+    //! measured with [`visible_width`] instead.
+
+    /// Columns one char occupies in the terminal (best-effort wcwidth).
+    fn char_width(c: char) -> usize {
+        let cp = c as u32;
+        match cp {
+            // Zero width: combining marks, zero-width spaces/joiners,
+            // variation selectors.
+            0x0300..=0x036F
+            | 0x200B..=0x200F
+            | 0x20D0..=0x20FF
+            | 0xFE00..=0xFE0F
+            | 0x1F3FB..=0x1F3FF => 0,
+            // Double width: CJK, Hangul, fullwidth forms.
+            0x1100..=0x115F
+            | 0x2E80..=0x303E
+            | 0x3041..=0x33FF
+            | 0x3400..=0x4DBF
+            | 0x4E00..=0x9FFF
+            | 0xA000..=0xA4CF
+            | 0xAC00..=0xD7A3
+            | 0xF900..=0xFAFF
+            | 0xFE30..=0xFE4F
+            | 0xFF00..=0xFF60
+            | 0xFFE0..=0xFFE6 => 2,
+            // Double width: symbols terminals render with emoji presentation.
+            0x231A..=0x231B
+            | 0x23E9..=0x23F3
+            | 0x25FD..=0x25FE
+            | 0x2614..=0x2615
+            | 0x2648..=0x2653
+            | 0x267F
+            | 0x2693
+            | 0x26A1
+            | 0x26AA..=0x26AB
+            | 0x26BD..=0x26BE
+            | 0x26C4..=0x26C5
+            | 0x2705
+            | 0x270A..=0x270B
+            | 0x2728
+            | 0x274C
+            | 0x274E
+            | 0x2753..=0x2755
+            | 0x2757
+            | 0x2795..=0x2797
+            | 0x27B0
+            | 0x27BF
+            | 0x2B1B..=0x2B1C
+            | 0x2B50
+            | 0x2B55
+            | 0x1F000..=0x1FAFF => 2,
+            _ => 1,
+        }
+    }
+
+    /// Width of `s` as the terminal renders it. ANSI escape sequences
+    /// (CSI `ESC [ ... <final>`) take no columns.
+    pub fn visible_width(s: &str) -> usize {
+        let mut width = 0;
+        let mut chars = s.chars().peekable();
+        while let Some(c) = chars.next() {
+            if c == '\x1b' {
+                if chars.peek() == Some(&'[') {
+                    chars.next();
+                    for c2 in chars.by_ref() {
+                        if ('\x40'..='\x7e').contains(&c2) {
+                            break;
+                        }
+                    }
+                }
+                continue;
+            }
+            width += char_width(c);
+        }
+        width
+    }
+
+    /// Left-align `s` in `width` display columns.
+    pub fn pad(s: &str, width: usize) -> String {
+        let w = visible_width(s);
+        if w >= width {
+            s.to_string()
+        } else {
+            format!("{}{}", s, " ".repeat(width - w))
+        }
+    }
+
+    /// Center `s` in `width` display columns.
+    pub fn center(s: &str, width: usize) -> String {
+        let w = visible_width(s);
+        if w >= width {
+            return s.to_string();
+        }
+        let left = (width - w) / 2;
+        format!("{}{}{}", " ".repeat(left), s, " ".repeat(width - w - left))
+    }
+}
+
+// ============================================================================
 // UNICODE CHESS PIECES
 // ============================================================================
 
@@ -132,23 +245,38 @@ impl BoardDisplay {
     }
 
     fn clear_screen(&self) {
-        print!("\x1b[2J\x1b[H"); // Clear screen and move to top
+        // 2J clears the visible screen, 3J clears the scrollback buffer, H
+        // homes the cursor. Without 3J every redraw leaves a stale copy of
+        // the previous frame in the terminal's scrollback, which shows up as
+        // duplicated, torn boards when the user scrolls.
+        print!("\x1b[2J\x1b[3J\x1b[H");
+        io::stdout().flush().ok();
     }
 
     fn print_header(&self) {
         use colors::*;
+        let inner = PANEL_WIDTH - 2;
         println!();
         println!(
-            "{}{}╔════════════════════════════════════════════════════════════╗{}",
-            BOLD, BRIGHT_CYAN, RESET
+            "{}{}╔{}╗{}",
+            BOLD,
+            BRIGHT_CYAN,
+            "═".repeat(inner),
+            RESET
         );
         println!(
-            "{}{}║          🏆  RUST CHESS ENGINE - INTERACTIVE UI  🏆        ║{}",
-            BOLD, BRIGHT_CYAN, RESET
+            "{}{}║{}║{}",
+            BOLD,
+            BRIGHT_CYAN,
+            text::center("🏆  RUST CHESS ENGINE - INTERACTIVE UI  🏆", inner),
+            RESET
         );
         println!(
-            "{}{}╚════════════════════════════════════════════════════════════╝{}",
-            BOLD, BRIGHT_CYAN, RESET
+            "{}{}╚{}╝{}",
+            BOLD,
+            BRIGHT_CYAN,
+            "═".repeat(inner),
+            RESET
         );
         println!();
     }
@@ -165,8 +293,12 @@ impl BoardDisplay {
         };
 
         for rank in ranks {
-            // Rank number
-            print!("  {} ║", rank + 1);
+            // Rank number (or matching blank margin when coords are off).
+            if self.show_coords {
+                print!("  {} ║", rank + 1);
+            } else {
+                print!("    ║");
+            }
 
             let files: Vec<i32> = if self.flip_board {
                 (0..8).rev().collect()
@@ -182,10 +314,13 @@ impl BoardDisplay {
                 let bg = self.get_square_color(sq, rank, file);
 
                 // Get piece symbol
-                let symbol = if self.use_unicode {
-                    symbols::piece_symbol(piece)
+                let symbol: String = if self.use_unicode {
+                    symbols::piece_symbol(piece).to_string()
                 } else {
-                    &piece.to_char().to_string()
+                    match piece.to_char() {
+                        '.' => ' '.to_string(),
+                        c => c.to_string(),
+                    }
                 };
 
                 // Color the piece
@@ -206,10 +341,12 @@ impl BoardDisplay {
         println!("    ╚════════════════════════════════════════╝");
 
         // File labels
-        if self.flip_board {
-            println!("       h    g    f    e    d    c    b    a   ");
-        } else {
-            println!("       a    b    c    d    e    f    g    h   ");
+        if self.show_coords {
+            if self.flip_board {
+                println!("       h    g    f    e    d    c    b    a   ");
+            } else {
+                println!("       a    b    c    d    e    f    g    h   ");
+            }
         }
         println!();
     }
@@ -239,10 +376,8 @@ impl BoardDisplay {
     fn print_game_info(&self, board: &Board) {
         use colors::*;
 
-        println!(
-            "{}┌─────────────────────────────────────────────────────────┐{}",
-            BRIGHT_BLUE, RESET
-        );
+        let inner = PANEL_WIDTH - 2;
+        println!("{}┌{}┐{}", BRIGHT_BLUE, "─".repeat(inner), RESET);
 
         let side = if board.side_white {
             format!("{}White{}", BRIGHT_WHITE, RESET)
@@ -250,9 +385,17 @@ impl BoardDisplay {
             format!("{}Black{}", BRIGHT_BLACK, RESET)
         };
 
-        println!(
-            "│ {}Turn:{} {}  │  {}Move:{} {}  │  {}Halfmove:{} {}  │",
+        let row1 = format!(
+            " {}Turn:{} {}  │  {}Move:{} {}  │  {}Halfmove:{} {}",
             BOLD, RESET, side, BOLD, RESET, board.fullmove, BOLD, RESET, board.halfmove_clock
+        );
+        println!(
+            "{}│{}{}{}│{}",
+            BRIGHT_BLUE,
+            RESET,
+            text::pad(&row1, inner),
+            BRIGHT_BLUE,
+            RESET
         );
 
         let castling = format!(
@@ -268,15 +411,20 @@ impl BoardDisplay {
             None => "-".to_string(),
         };
 
-        println!(
-            "│ {}Castling:{} {}  │  {}En Passant:{} {}  │",
+        let row2 = format!(
+            " {}Castling:{} {}  │  {}En Passant:{} {}",
             BOLD, RESET, castling, BOLD, RESET, ep
         );
-
         println!(
-            "{}└─────────────────────────────────────────────────────────┘{}",
-            BRIGHT_BLUE, RESET
+            "{}│{}{}{}│{}",
+            BRIGHT_BLUE,
+            RESET,
+            text::pad(&row2, inner),
+            BRIGHT_BLUE,
+            RESET
         );
+
+        println!("{}└{}┘{}", BRIGHT_BLUE, "─".repeat(inner), RESET);
         println!();
     }
 
@@ -304,22 +452,17 @@ impl BoardDisplay {
         println!();
     }
 
-    pub fn print_analysis(&self, depth: i32, score: i32, nodes: u64, time_ms: u128, pv: &str) {
+    /// Render one search result as a closed box. `score_str` is the engine's
+    /// own formatting (e.g. `+0.34` or `#3`), which handles mate distances
+    /// correctly.
+    pub fn print_analysis(&self, depth: i32, score_str: &str, nodes: u64, time_ms: u128, pv: &str) {
         use colors::*;
 
-        println!("{}{}─── Engine Analysis ───{}", BOLD, BRIGHT_GREEN, RESET);
-
-        let score_display = if score > 20000 {
-            format!("{}Mate in {}{}", BRIGHT_GREEN, (20000 - score) / 100, RESET)
-        } else if score < -20000 {
-            format!("{}Mate in {}{}", BRIGHT_RED, (20000 + score) / 100, RESET)
+        let inner = PANEL_WIDTH - 2;
+        let score_color = if score_str.starts_with('-') || score_str.starts_with("#-") {
+            BRIGHT_RED
         } else {
-            format!(
-                "{}{:.2}{}",
-                if score >= 0 { BRIGHT_GREEN } else { BRIGHT_RED },
-                score as f32 / 100.0,
-                RESET
-            )
+            BRIGHT_GREEN
         };
 
         let nps = if time_ms > 0 {
@@ -328,19 +471,57 @@ impl BoardDisplay {
             0
         };
 
+        // Title embedded in the top border.
+        let title = format!(" {}{}Engine Analysis{}{} ", BOLD, BRIGHT_GREEN, RESET, BRIGHT_GREEN);
+        let title_w = text::visible_width(&title);
         println!(
-            "│ Depth: {}{}{}  │  Score: {}  │",
-            BRIGHT_CYAN, depth, RESET, score_display
-        );
-        println!(
-            "│ Nodes: {}{}{}  │  Time: {}{}ms{}  │  NPS: {}{}{}  │",
-            BRIGHT_YELLOW, nodes, RESET, BRIGHT_YELLOW, time_ms, RESET, BRIGHT_YELLOW, nps, RESET
+            "{}┌───{}{}┐{}",
+            BRIGHT_GREEN,
+            title,
+            "─".repeat(inner.saturating_sub(3 + title_w)),
+            RESET
         );
 
+        let mut rows = vec![
+            format!(
+                " Depth: {}{}{}  │  Score: {}{}{}",
+                BRIGHT_CYAN, depth, RESET, score_color, score_str, RESET
+            ),
+            format!(
+                " Nodes: {}{}{}  │  Time: {}{}ms{}  │  NPS: {}{}{}",
+                BRIGHT_YELLOW, nodes, RESET, BRIGHT_YELLOW, time_ms, RESET, BRIGHT_YELLOW, nps,
+                RESET
+            ),
+        ];
+
+        // Wrap the PV so long lines never break out of the box.
         if !pv.is_empty() {
-            println!("│ PV: {}{}{}", BRIGHT_WHITE, pv, RESET);
+            let mut line = String::from(" PV:");
+            for mv in pv.split_whitespace() {
+                if text::visible_width(&line) + 1 + mv.len() > inner - 1 {
+                    rows.push(format!("{}{}{}", BRIGHT_WHITE, line, RESET));
+                    line = String::from("    ");
+                }
+                line.push(' ');
+                line.push_str(mv);
+            }
+            if !line.trim().is_empty() {
+                rows.push(format!("{}{}{}", BRIGHT_WHITE, line, RESET));
+            }
         }
 
+        for row in rows {
+            println!(
+                "{}│{}{}{}│{}",
+                BRIGHT_GREEN,
+                RESET,
+                text::pad(&row, inner),
+                BRIGHT_GREEN,
+                RESET
+            );
+        }
+
+        println!("{}└{}┘{}", BRIGHT_GREEN, "─".repeat(inner), RESET);
         println!();
     }
 
@@ -360,17 +541,8 @@ impl BoardDisplay {
         format!("{}{}", file, rank)
     }
 
-    fn render_centered(&self, text: &str, width: usize) -> String {
-        let text_len = text.len();
-        if text_len >= width {
-            return text.to_string();
-        }
-
-        let padding = (width - text_len) / 2;
-        let mut result = " ".repeat(padding);
-        result.push_str(text);
-        result.push_str(&" ".repeat(width - text_len - padding));
-        result
+    fn render_centered(&self, s: &str, width: usize) -> String {
+        text::center(s, width)
     }
 }
 
@@ -410,21 +582,28 @@ impl Menu {
     pub fn display(&self) {
         use colors::*;
 
+        let inner = PANEL_WIDTH - 2;
         println!();
         println!(
-            "{}{}╔════════════════════════════════════════════════════════╗{}",
-            BOLD, BRIGHT_CYAN, RESET
-        );
-        println!(
-            "{}{}║  {}  ║{}",
+            "{}{}╔{}╗{}",
             BOLD,
             BRIGHT_CYAN,
-            self.center_text(&self.title, 52),
+            "═".repeat(inner),
             RESET
         );
         println!(
-            "{}{}╚════════════════════════════════════════════════════════╝{}",
-            BOLD, BRIGHT_CYAN, RESET
+            "{}{}║{}║{}",
+            BOLD,
+            BRIGHT_CYAN,
+            self.center_text(&self.title, inner),
+            RESET
+        );
+        println!(
+            "{}{}╚{}╝{}",
+            BOLD,
+            BRIGHT_CYAN,
+            "═".repeat(inner),
+            RESET
         );
         println!();
 
@@ -477,17 +656,8 @@ impl Menu {
         Ok(String::new())
     }
 
-    fn center_text(&self, text: &str, width: usize) -> String {
-        let text_len = text.len();
-        if text_len >= width {
-            return text.to_string();
-        }
-
-        let padding = (width - text_len) / 2;
-        let mut result = " ".repeat(padding);
-        result.push_str(text);
-        result.push_str(&" ".repeat(width - text_len - padding));
-        result
+    fn center_text(&self, s: &str, width: usize) -> String {
+        text::center(s, width)
     }
 }
 
@@ -528,6 +698,10 @@ impl GameInterface {
         self.game_mode = mode;
     }
 
+    pub fn mode(&self) -> GameMode {
+        self.game_mode
+    }
+
     pub fn show_game_screen(&self, board: &Board) {
         self.display.render(board);
 
@@ -558,17 +732,38 @@ impl GameInterface {
     fn print_command_bar(&self) {
         use colors::*;
 
+        let inner = PANEL_WIDTH - 2;
+        // Two columns: "<cmd:12> <desc:17>" each, separated by a middle rule.
+        // 1 + 12 + 1 + 17 + 1 = 32 per column; 32 + 1 + 32 = 65 = inner.
+        let col = |cmd: &str, desc: &str| {
+            format!(" {}{:<12}{} {:<17} ", BRIGHT_GREEN, cmd, RESET, desc)
+        };
+        let empty_col = " ".repeat(32);
+
         println!(
-            "{}{}┌────────────────────────────────────────────────────────┐{}",
-            BOLD, BRIGHT_BLUE, RESET
+            "{}{}┌{}┐{}",
+            BOLD,
+            BRIGHT_BLUE,
+            "─".repeat(inner),
+            RESET
         );
         println!(
-            "{}{}│                      COMMANDS                          │{}",
-            BOLD, BRIGHT_BLUE, RESET
+            "{}{}│{}{}{}{}│{}",
+            BOLD,
+            BRIGHT_BLUE,
+            RESET,
+            text::center(&format!("{}{}COMMANDS{}", BOLD, BRIGHT_MAGENTA, RESET), inner),
+            BOLD,
+            BRIGHT_BLUE,
+            RESET
         );
         println!(
-            "{}{}└────────────────────────────────────────────────────────┘{}",
-            BOLD, BRIGHT_BLUE, RESET
+            "{}{}├{}┼{}┤{}",
+            BOLD,
+            BRIGHT_BLUE,
+            "─".repeat(32),
+            "─".repeat(32),
+            RESET
         );
 
         let commands = vec![
@@ -587,16 +782,25 @@ impl GameInterface {
 
         for chunk in commands.chunks(2) {
             if let Some(&(cmd, desc)) = chunk.first() {
-                print!("│ {}{:<15}{} {:<20}", BRIGHT_GREEN, cmd, RESET, desc);
-                if let Some(&(c2, d2)) = chunk.get(1) {
-                    print!("│ {}{:<15}{} {:<20}", BRIGHT_GREEN, c2, RESET, d2);
-                } else {
-                    print!("│ {:<36}", "");
-                }
-                println!("│");
+                let left = col(cmd, desc);
+                let right = match chunk.get(1) {
+                    Some(&(c2, d2)) => col(c2, d2),
+                    None => empty_col.clone(),
+                };
+                println!(
+                    "{}│{}{}{}│{}{}{}│{}",
+                    BRIGHT_BLUE, RESET, left, BRIGHT_BLUE, RESET, right, BRIGHT_BLUE, RESET
+                );
             }
         }
 
+        println!(
+            "{}└{}┴{}┘{}",
+            BRIGHT_BLUE,
+            "─".repeat(32),
+            "─".repeat(32),
+            RESET
+        );
         println!();
     }
 
@@ -623,24 +827,26 @@ impl GameInterface {
                 "BASIC COMMANDS",
                 vec![
                     ("move <from><to>[promo]", "Make a move (e.g., e2e4, e7e8q)"),
+                    ("<move>", "SAN also works directly (e.g., Nf3, e4)"),
                     ("undo / u", "Undo the last move"),
                     ("redo / r", "Redo a previously undone move"),
                     ("resign", "Resign the current game"),
-                    ("new", "Start a new game"),
+                    ("new", "Start a new game from the initial position"),
+                    ("menu", "Leave the game and return to the main menu"),
                 ],
             ),
             (
                 "BOARD CONTROLS",
                 vec![
                     ("flip / f", "Flip the board orientation"),
-                    ("coords on/off", "Toggle coordinate display"),
-                    ("unicode on/off", "Toggle Unicode pieces"),
+                    ("coords on|off", "Toggle coordinate display"),
+                    ("unicode on|off", "Toggle Unicode pieces"),
                 ],
             ),
             (
                 "ENGINE COMMANDS",
                 vec![
-                    ("hint", "Get a move suggestion from engine"),
+                    ("hint / h", "Get a move suggestion from engine"),
                     ("analyze [depth]", "Deep position analysis"),
                     ("go depth <n>", "Engine thinks to depth n"),
                     ("go time <ms>", "Engine thinks for ms milliseconds"),
@@ -659,8 +865,8 @@ impl GameInterface {
             (
                 "STATISTICS",
                 vec![
-                    ("stats", "Show engine statistics"),
-                    ("hash", "Show position hash value"),
+                    ("stats", "Show statistics of the last search"),
+                    ("hash", "Show the position's Zobrist hash"),
                     ("eval", "Show static evaluation"),
                     ("perft <depth>", "Run perft test"),
                 ],
@@ -704,19 +910,15 @@ impl GameInterface {
 
         self.display.clear_screen();
 
+        let inner = PANEL_WIDTH - 2;
         println!();
         println!(
-            "{}{}╔════════════════════════════════════════════════════════╗{}",
-            BOLD, BRIGHT_MAGENTA, RESET
+            "{}{}╔{}╗{}",
+            BOLD,
+            BRIGHT_MAGENTA,
+            "═".repeat(inner),
+            RESET
         );
-
-        let (_msg, _color) = match result {
-            GameResult::WhiteWins => ("🏆  WHITE WINS!  🏆", BRIGHT_GREEN),
-            GameResult::BlackWins => ("🏆  BLACK WINS!  🏆", BRIGHT_GREEN),
-            GameResult::Draw => ("🤝  DRAW  🤝", BRIGHT_YELLOW),
-            GameResult::Stalemate => ("😐  STALEMATE  😐", BRIGHT_BLUE),
-            GameResult::Resignation => ("🏳  RESIGNATION  🏳", BRIGHT_RED),
-        };
 
         let msg_text = match result {
             GameResult::WhiteWins => "🏆  WHITE WINS!  🏆",
@@ -727,15 +929,18 @@ impl GameInterface {
         };
 
         println!(
-            "{}{}║  {}  ║{}",
+            "{}{}║{}║{}",
             BOLD,
             BRIGHT_MAGENTA,
-            self.display.render_centered(msg_text, 52),
+            self.display.render_centered(msg_text, inner),
             RESET
         );
         println!(
-            "{}{}╚════════════════════════════════════════════════════════╝{}",
-            BOLD, BRIGHT_MAGENTA, RESET
+            "{}{}╚{}╝{}",
+            BOLD,
+            BRIGHT_MAGENTA,
+            "═".repeat(inner),
+            RESET
         );
         println!();
 
@@ -938,18 +1143,28 @@ impl StatsDisplay {
     pub fn show_engine_stats(nodes: u64, time_ms: u128, tt_hits: u64, tt_probes: u64) {
         use colors::*;
 
+        let inner = PANEL_WIDTH - 2;
         println!();
         println!(
-            "{}{}╔════════════════════════════════════════════════════════╗{}",
-            BOLD, BRIGHT_CYAN, RESET
+            "{}{}╔{}╗{}",
+            BOLD,
+            BRIGHT_CYAN,
+            "═".repeat(inner),
+            RESET
         );
         println!(
-            "{}{}║              ENGINE STATISTICS                         ║{}",
-            BOLD, BRIGHT_CYAN, RESET
+            "{}{}║{}║{}",
+            BOLD,
+            BRIGHT_CYAN,
+            text::center("ENGINE STATISTICS", inner),
+            RESET
         );
         println!(
-            "{}{}╚════════════════════════════════════════════════════════╝{}",
-            BOLD, BRIGHT_CYAN, RESET
+            "{}{}╚{}╝{}",
+            BOLD,
+            BRIGHT_CYAN,
+            "═".repeat(inner),
+            RESET
         );
         println!();
 
@@ -1106,26 +1321,29 @@ impl Notification {
     pub fn show(&self) {
         use colors::*;
 
+        // Deterministic single-column marker; emoji here would shift the
+        // right border on terminals that render them two columns wide.
         let (icon, color) = match self.kind {
-            NotificationKind::Info => ("ℹ️", BRIGHT_BLUE),
-            NotificationKind::Success => ("✅", BRIGHT_GREEN),
-            NotificationKind::Warning => ("⚠️", BRIGHT_YELLOW),
-            NotificationKind::Error => ("❌", BRIGHT_RED),
+            NotificationKind::Info => ("●", BRIGHT_BLUE),
+            NotificationKind::Success => ("●", BRIGHT_GREEN),
+            NotificationKind::Warning => ("●", BRIGHT_YELLOW),
+            NotificationKind::Error => ("●", BRIGHT_RED),
         };
 
+        let inner = PANEL_WIDTH - 2;
+        let row = format!(" {} {}{}{}{}", icon, BOLD, color, self.message, RESET);
+
         println!();
+        println!("{}┌{}┐{}", color, "─".repeat(inner), RESET);
         println!(
-            "{}┌─────────────────────────────────────────────────────────┐{}",
-            color, RESET
+            "{}│{}{}{}│{}",
+            color,
+            RESET,
+            text::pad(&row, inner),
+            color,
+            RESET
         );
-        println!(
-            "{}│ {} {}{}  {:<50} {}│{}",
-            color, icon, BOLD, color, self.message, RESET, color
-        );
-        println!(
-            "{}└─────────────────────────────────────────────────────────┘{}",
-            color, RESET
-        );
+        println!("{}└{}┘{}", color, "─".repeat(inner), RESET);
         println!();
     }
 
@@ -1550,6 +1768,29 @@ mod tests {
         assert!(InputValidator::validate_move("e2").is_err());
         assert!(InputValidator::validate_move("e2e9").is_err());
         assert!(InputValidator::validate_move("z1a1").is_err());
+    }
+
+    #[test]
+    fn test_visible_width_ignores_ansi_and_counts_emoji() {
+        assert_eq!(text::visible_width("abc"), 3);
+        assert_eq!(text::visible_width("\x1b[1m\x1b[96mabc\x1b[0m"), 3);
+        assert_eq!(text::visible_width("🏆"), 2);
+        assert_eq!(text::visible_width("🏠 MAIN MENU"), 12);
+        assert_eq!(text::visible_width("♔"), 1);
+        assert_eq!(text::visible_width(""), 0);
+    }
+
+    #[test]
+    fn test_pad_and_center_fill_to_display_width() {
+        assert_eq!(text::visible_width(&text::pad("🏠 MENU", 20)), 20);
+        assert_eq!(text::visible_width(&text::center("🏆 X 🏆", 30)), 30);
+        assert_eq!(
+            text::visible_width(&text::center("\x1b[1mCOMMANDS\x1b[0m", 65)),
+            65
+        );
+        // Already-too-wide strings are returned unchanged.
+        assert_eq!(text::pad("abcdef", 3), "abcdef");
+        assert_eq!(text::center("abcdef", 3), "abcdef");
     }
 
     #[test]
