@@ -9,6 +9,7 @@
 use crate::board::Board;
 use crate::engine::{game_status, GameStatus};
 use crate::eval::eval_terms;
+use crate::log::SearchTelemetry;
 use crate::moves::Move;
 use crate::movegen::legal_moves;
 use crate::pgn::PgnGame;
@@ -36,6 +37,18 @@ pub struct GameController {
     /// FEN the current game started from (for PGN export).
     start_fen: String,
     game_active: bool,
+    /// Telemetry of the most recent search (for the `stats` command).
+    last_search: Option<SearchTelemetry>,
+}
+
+/// What became of a command string offered to [`GameController::shared_command`].
+enum Shared {
+    /// Not a shared command; the caller should try its own handling.
+    NotHandled,
+    /// Executed; the position or board display changed, so redraw.
+    Redraw,
+    /// Executed; nothing on the board changed.
+    Stay,
 }
 
 impl GameController {
@@ -49,6 +62,7 @@ impl GameController {
             redo: Vec::new(),
             start_fen: crate::board::START_FEN.to_string(),
             game_active: false,
+            last_search: None,
         }
     }
 
@@ -103,6 +117,10 @@ impl GameController {
             self.board.unmake_move();
             self.redo.push(mv);
             self.rebuild_history();
+            match self.played.last() {
+                Some(last) => self.interface.highlight_move(last.from, last.to),
+                None => self.interface.clear_highlights(),
+            }
         }
     }
 
@@ -111,7 +129,9 @@ impl GameController {
             let san = move_to_san(&self.board, mv);
             self.board.make_move_struct(mv);
             self.played.push(mv);
+            self.interface.highlight_move(mv.from, mv.to);
             self.move_history.add_move(san.clone());
+            self.interface.add_move_to_history(san);
         }
     }
 
@@ -244,6 +264,7 @@ impl GameController {
         };
         let start = Instant::now();
         let res = search(&mut self.board, limits);
+        self.last_search = Some(res.telemetry);
         let Some(mv) = res.best_move else {
             self.interface.show_error("Engine couldn't find a move!");
             self.game_active = false;
@@ -266,8 +287,9 @@ impl GameController {
         true
     }
 
+    /// Free analysis loop. Note: does NOT reset the game, so a position
+    /// loaded from PGN (or set up beforehand) survives entering this mode.
     fn analysis_mode(&mut self) {
-        self.reset_game();
         loop {
             self.interface.show_game_screen(&self.board);
             let input = self.interface.prompt_input("analysis");
@@ -275,32 +297,36 @@ impl GameController {
                 continue;
             }
             let parts: Vec<&str> = input.split_whitespace().collect();
+
+            // This loop redraws the screen every iteration, so shared
+            // commands pause for Enter before their output is wiped.
+            match self.shared_command(&parts, true) {
+                Shared::Redraw | Shared::Stay => continue,
+                Shared::NotHandled => {}
+            }
+
             match parts[0] {
                 "move" | "m" => {
-                    if let Some(s) = parts.get(1)
-                        && let Err(e) = self.try_play(s) {
+                    if let Some(s) = parts.get(1) {
+                        if let Err(e) = self.try_play(s) {
                             self.interface.show_error(&e);
+                            self.pause_enter();
                         }
+                    } else {
+                        self.interface.show_error("Usage: move e2e4");
+                        self.pause_enter();
+                    }
                 }
-                "analyze" | "a" => {
-                    let depth = parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(8);
-                    self.run_analysis(depth);
-                }
-                "eval" | "e" => self.show_evaluation(),
-                "perft" => {
-                    let depth = parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(4);
-                    self.run_perft(depth);
-                }
-                "fen" => self.interface.show_info(&self.board.to_fen()),
                 "undo" | "u" => self.undo(),
                 "redo" | "r" => self.redo_last(),
-                "flip" | "f" => {
-                    self.interface.display.flip_board = !self.interface.display.flip_board;
-                }
-                "back" | "exit" | "quit" => break,
+                "new" => self.reset_game(),
+                "help" => self.interface.show_help(),
+                "back" | "exit" | "quit" | "menu" | "resign" => break,
                 _ => {
                     if self.try_play(parts[0]).is_err() {
-                        self.interface.show_error("Unknown command");
+                        self.interface
+                            .show_error(&format!("Unknown command or illegal move '{}'", input));
+                        self.pause_enter();
                     }
                 }
             }
@@ -315,6 +341,15 @@ impl GameController {
                 continue;
             }
             let parts: Vec<&str> = input.split_whitespace().collect();
+
+            // This loop keeps prompting without redrawing, so shared command
+            // output stays visible; no pause needed.
+            match self.shared_command(&parts, false) {
+                Shared::Redraw => return true,
+                Shared::Stay => continue,
+                Shared::NotHandled => {}
+            }
+
             match parts[0] {
                 "move" | "m" => {
                     if let Some(s) = parts.get(1) {
@@ -327,26 +362,30 @@ impl GameController {
                     }
                 }
                 "undo" | "u" => {
+                    // Against the engine, take back its reply as well so it
+                    // is still the human's turn afterwards.
                     self.undo();
+                    if self.interface.mode() == GameMode::HumanVsEngine {
+                        self.undo();
+                    }
                     return true;
                 }
                 "redo" | "r" => {
                     self.redo_last();
+                    if self.interface.mode() == GameMode::HumanVsEngine {
+                        self.redo_last();
+                    }
                     return true;
                 }
-                "hint" | "h" => self.show_hint(),
-                "analyze" => self.run_analysis(self.settings.get_search_depth()),
-                "eval" => self.show_evaluation(),
-                "fen" => self.interface.show_info(&self.board.to_fen()),
-                "flip" | "f" => {
-                    self.interface.display.flip_board = !self.interface.display.flip_board;
-                    return true;
-                }
-                "save" => {
-                    self.save_game();
+                "new" => {
+                    if ConfirmDialog::confirm("Start a new game? Current game will be lost.") {
+                        self.reset_game();
+                        return true;
+                    }
                 }
                 "resign" => {
                     if ConfirmDialog::confirm("Are you sure you want to resign?") {
+                        self.interface.show_game_result(GameResult::Resignation);
                         self.game_active = false;
                         return false;
                     }
@@ -369,6 +408,196 @@ impl GameController {
                 },
             }
         }
+    }
+
+    /// Commands available at every in-game prompt (both the play loops and
+    /// analysis mode). `pause` should be true when the caller redraws the
+    /// screen right after, so printed output waits for Enter first.
+    fn shared_command(&mut self, parts: &[&str], pause: bool) -> Shared {
+        match parts[0] {
+            "hint" | "h" => {
+                self.show_hint();
+                Shared::Stay
+            }
+            "analyze" | "a" => {
+                let depth = parts
+                    .get(1)
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or_else(|| self.settings.get_search_depth());
+                self.run_analysis(depth);
+                Shared::Stay
+            }
+            "go" => {
+                self.run_go(parts, pause);
+                Shared::Stay
+            }
+            "eval" | "e" => {
+                self.show_evaluation();
+                if pause {
+                    self.pause_enter();
+                }
+                Shared::Stay
+            }
+            "fen" => {
+                self.interface.show_info(&self.board.to_fen());
+                if pause {
+                    self.pause_enter();
+                }
+                Shared::Stay
+            }
+            "hash" => {
+                self.interface
+                    .show_info(&format!("Zobrist key: 0x{:016x}", self.board.key));
+                if pause {
+                    self.pause_enter();
+                }
+                Shared::Stay
+            }
+            "pgn" => {
+                let game = PgnGame::from_moves(&self.start_fen, self.played.clone());
+                println!("\n{}", game.to_pgn());
+                if pause {
+                    self.pause_enter();
+                }
+                Shared::Stay
+            }
+            "stats" => {
+                self.show_search_stats();
+                if pause {
+                    self.pause_enter();
+                }
+                Shared::Stay
+            }
+            "perft" => {
+                let depth = parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(4);
+                self.run_perft(depth);
+                Shared::Stay
+            }
+            "save" => {
+                self.save_game(parts.get(1).copied());
+                if pause {
+                    self.pause_enter();
+                }
+                Shared::Stay
+            }
+            "load" => {
+                if self.load_into_state(parts.get(1).copied()) {
+                    Shared::Redraw
+                } else {
+                    if pause {
+                        self.pause_enter();
+                    }
+                    Shared::Stay
+                }
+            }
+            "position" => {
+                if self.set_position(parts) {
+                    Shared::Redraw
+                } else {
+                    if pause {
+                        self.pause_enter();
+                    }
+                    Shared::Stay
+                }
+            }
+            "flip" | "f" => {
+                self.interface.display.flip_board = !self.interface.display.flip_board;
+                Shared::Redraw
+            }
+            "coords" => {
+                let display = &mut self.interface.display;
+                display.show_coords = match parts.get(1).copied() {
+                    Some("on") => true,
+                    Some("off") => false,
+                    _ => !display.show_coords,
+                };
+                Shared::Redraw
+            }
+            "unicode" => {
+                let display = &mut self.interface.display;
+                display.use_unicode = match parts.get(1).copied() {
+                    Some("on") => true,
+                    Some("off") => false,
+                    _ => !display.use_unicode,
+                };
+                Shared::Redraw
+            }
+            _ => Shared::NotHandled,
+        }
+    }
+
+    /// `go depth <n>` / `go time <ms>`: run a search with explicit limits and
+    /// report it (analysis only; no move is played).
+    fn run_go(&mut self, parts: &[&str], pause: bool) {
+        let arg = parts.get(2).and_then(|s| s.parse::<u64>().ok());
+        let limits = match (parts.get(1).copied(), arg) {
+            (Some("depth"), Some(n)) => SearchLimits {
+                max_depth: (n as i32).clamp(1, 32),
+                movetime_ms: None,
+                verbose: false,
+            },
+            (Some("time"), Some(ms)) => SearchLimits {
+                max_depth: 32,
+                movetime_ms: Some(ms),
+                verbose: false,
+            },
+            _ => {
+                self.interface.show_error("Usage: go depth <n>  or  go time <ms>");
+                if pause {
+                    self.pause_enter();
+                }
+                return;
+            }
+        };
+        self.run_search_report(limits);
+    }
+
+    /// `position fen <fen>` / `position startpos`: replace the game state.
+    fn set_position(&mut self, parts: &[&str]) -> bool {
+        let board = match parts.get(1).copied() {
+            Some("startpos") => Board::startpos(),
+            Some("fen") if parts.len() > 2 => {
+                let fen = parts[2..].join(" ");
+                match Board::from_fen(&fen) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        self.interface.show_error(&format!("Bad FEN: {}", e));
+                        return false;
+                    }
+                }
+            }
+            _ => {
+                self.interface
+                    .show_error("Usage: position fen <FEN>  or  position startpos");
+                return false;
+            }
+        };
+        self.start_fen = board.to_fen();
+        self.board = board;
+        self.played.clear();
+        self.redo.clear();
+        self.move_history.clear();
+        self.interface.clear_history();
+        self.interface.clear_highlights();
+        true
+    }
+
+    fn show_search_stats(&self) {
+        match self.last_search {
+            Some(t) => StatsDisplay::show_engine_stats(t.nodes, t.elapsed_ms, t.tt_hits, t.tt_probes),
+            None => self
+                .interface
+                .show_info("No search run yet. Try 'analyze', 'hint', or 'go' first."),
+        }
+    }
+
+    /// Block until the user presses Enter (so output is not wiped by the
+    /// next screen redraw).
+    fn pause_enter(&self) {
+        use crate::ui::colors::*;
+        println!("{}Press Enter to continue...{}", DIM, RESET);
+        let mut dummy = String::new();
+        io::stdin().read_line(&mut dummy).ok();
     }
 
     /// Parse a UCI or SAN move string, verify legality, and commit it.
@@ -407,6 +636,7 @@ impl GameController {
             verbose: false,
         };
         let res = search(&mut self.board, limits);
+        self.last_search = Some(res.telemetry);
         match res.best_move {
             Some(mv) => {
                 let san = move_to_san(&self.board, mv);
@@ -422,20 +652,31 @@ impl GameController {
 
     fn run_analysis(&mut self, depth: i32) {
         use crate::ui::colors::*;
-        println!("{}{}Running analysis to depth {}...{}", BOLD, BRIGHT_CYAN, depth, RESET);
-        let limits = SearchLimits {
+        println!(
+            "{}{}Running analysis to depth {}...{}",
+            BOLD, BRIGHT_CYAN, depth, RESET
+        );
+        self.run_search_report(SearchLimits {
             max_depth: depth,
             movetime_ms: Some(5000),
             verbose: false,
-        };
+        });
+    }
+
+    /// Search with `limits`, render the result panel, record telemetry, and
+    /// wait for Enter so the panel can be read.
+    fn run_search_report(&mut self, limits: SearchLimits) {
         let res = search(&mut self.board, limits);
+        self.last_search = Some(res.telemetry);
         let pv = self.pv_to_san(&res.pv);
-        self.interface
-            .display
-            .print_analysis(res.depth, res.score, res.nodes, res.time_ms, &pv);
-        let mut dummy = String::new();
-        println!("{}Press Enter to continue...{}", DIM, RESET);
-        io::stdin().read_line(&mut dummy).ok();
+        self.interface.display.print_analysis(
+            res.depth,
+            &res.score_string(),
+            res.nodes,
+            res.time_ms,
+            &pv,
+        );
+        self.pause_enter();
     }
 
     /// Render a principal variation (a list of moves) as space-separated SAN.
@@ -475,9 +716,7 @@ impl GameController {
             start.elapsed(),
             RESET
         );
-        let mut dummy = String::new();
-        println!("Press Enter to continue...");
-        io::stdin().read_line(&mut dummy).ok();
+        self.pause_enter();
     }
 
     fn check_game_end(&mut self) -> Option<GameResult> {
@@ -503,20 +742,21 @@ impl GameController {
         let options = vec!["Save Game (PGN)", "Show PGN", "Main Menu"];
         let choice = ConfirmDialog::choose("What would you like to do?", &options);
         match choice {
-            0 => self.save_game(),
+            0 => self.save_game(None),
             1 => {
                 let game = PgnGame::from_moves(&self.start_fen, self.played.clone());
                 println!("\n{}", game.to_pgn());
-                let mut dummy = String::new();
-                println!("Press Enter to continue...");
-                io::stdin().read_line(&mut dummy).ok();
+                self.pause_enter();
             }
             _ => {}
         }
     }
 
-    fn save_game(&self) {
-        let filename = self.interface.prompt_input("Save as (filename)");
+    fn save_game(&self, filename: Option<&str>) {
+        let filename = match filename {
+            Some(f) => f.to_string(),
+            None => self.interface.prompt_input("Save as (filename)"),
+        };
         if filename.is_empty() {
             self.interface.show_warning("Save cancelled");
             return;
@@ -528,16 +768,71 @@ impl GameController {
         };
         let game = PgnGame::from_moves(&self.start_fen, self.played.clone());
         match std::fs::write(&path, game.to_pgn()) {
-            Ok(()) => self.interface.show_success(&format!("Saved to {}", path)),
+            Ok(()) => {
+                // Report the full path so the user knows where to find (and
+                // later load) the game.
+                let shown = std::fs::canonicalize(&path)
+                    .map(|p| p.display().to_string())
+                    .unwrap_or(path);
+                self.interface.show_success(&format!("Saved to {}", shown));
+            }
             Err(e) => self.interface.show_error(&format!("Could not save: {}", e)),
         }
     }
 
+    /// Main-menu entry: load a PGN and open it in analysis mode.
     fn load_game(&mut self) {
-        let filename = self.interface.prompt_input("Load PGN (filename)");
+        if self.load_into_state(None) {
+            self.interface.set_game_mode(GameMode::Analysis);
+            self.game_active = true;
+            self.analysis_mode();
+        }
+    }
+
+    /// `.pgn` files in the current directory (where `save` writes), sorted.
+    fn list_saved_games() -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(".")
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter_map(|e| {
+                let name = e.file_name().into_string().ok()?;
+                name.ends_with(".pgn").then_some(name)
+            })
+            .collect();
+        names.sort();
+        names
+    }
+
+    fn show_saved_games(&self) {
+        let saves = Self::list_saved_games();
+        if saves.is_empty() {
+            let here = std::env::current_dir()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|_| ".".to_string());
+            self.interface
+                .show_info(&format!("No saved games (.pgn) found in {}", here));
+        } else {
+            self.interface
+                .show_info(&format!("Saved games here: {}", saves.join(", ")));
+        }
+    }
+
+    /// Load a PGN file and replace the current game state with it, prompting
+    /// for the filename when none is given. Returns true on success. Used
+    /// both from the main menu and by the in-game `load` command (which then
+    /// continues in the current mode).
+    fn load_into_state(&mut self, filename: Option<&str>) -> bool {
+        let filename = match filename {
+            Some(f) => f.to_string(),
+            None => {
+                self.show_saved_games();
+                self.interface.prompt_input("Load PGN (filename)")
+            }
+        };
         if filename.is_empty() {
             self.interface.show_warning("Load cancelled");
-            return;
+            return false;
         }
         let path = if filename.ends_with(".pgn") {
             filename
@@ -547,8 +842,10 @@ impl GameController {
         let text = match std::fs::read_to_string(&path) {
             Ok(t) => t,
             Err(e) => {
-                self.interface.show_error(&format!("Could not read {}: {}", path, e));
-                return;
+                self.interface
+                    .show_error(&format!("Could not read {}: {}", path, e));
+                self.show_saved_games();
+                return false;
             }
         };
         match PgnGame::parse(&text) {
@@ -562,13 +859,18 @@ impl GameController {
                     self.played.push(mv);
                 }
                 self.rebuild_history();
-                self.interface.set_game_mode(GameMode::Analysis);
-                self.game_active = true;
+                match self.played.last() {
+                    Some(last) => self.interface.highlight_move(last.from, last.to),
+                    None => self.interface.clear_highlights(),
+                }
                 self.interface
                     .show_success(&format!("Loaded {} ({} moves)", path, self.played.len()));
-                self.analysis_mode();
+                true
             }
-            Err(e) => self.interface.show_error(&format!("Bad PGN: {}", e)),
+            Err(e) => {
+                self.interface.show_error(&format!("Bad PGN: {}", e));
+                false
+            }
         }
     }
 
@@ -591,18 +893,29 @@ impl GameController {
 
     fn show_about(&self) {
         use crate::ui::colors::*;
+        use crate::ui::{text, PANEL_WIDTH};
+        let inner = PANEL_WIDTH - 2;
         println!();
         println!(
-            "{}{}╔════════════════════════════════════════════════════════╗{}",
-            BOLD, BRIGHT_CYAN, RESET
+            "{}{}╔{}╗{}",
+            BOLD,
+            BRIGHT_CYAN,
+            "═".repeat(inner),
+            RESET
         );
         println!(
-            "{}{}║              RUST CHESS ENGINE                          ║{}",
-            BOLD, BRIGHT_CYAN, RESET
+            "{}{}║{}║{}",
+            BOLD,
+            BRIGHT_CYAN,
+            text::center("RUST CHESS ENGINE", inner),
+            RESET
         );
         println!(
-            "{}{}╚════════════════════════════════════════════════════════╝{}",
-            BOLD, BRIGHT_CYAN, RESET
+            "{}{}╚{}╝{}",
+            BOLD,
+            BRIGHT_CYAN,
+            "═".repeat(inner),
+            RESET
         );
         println!();
         println!("  {}Features:{}", BOLD, RESET);
@@ -612,9 +925,7 @@ impl GameController {
         println!("    • SAN/PGN, UCI protocol, opening book");
         println!("    • Interactive terminal UI with multiple game modes");
         println!();
-        println!("{}Press Enter to continue...{}", DIM, RESET);
-        let mut dummy = String::new();
-        io::stdin().read_line(&mut dummy).ok();
+        self.pause_enter();
     }
 
     /// 0x88 square to algebraic, retained for any external callers.
