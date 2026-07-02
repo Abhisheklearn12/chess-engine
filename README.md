@@ -40,7 +40,7 @@ interactive terminal UI, observability hooks, and an extensive test suite.
 | **Evaluation** | Tapered (mid/endgame) **PeSTO** piece-square tables, material, bishop pair, doubled & passed pawns, mobility, king pawn-shield, rook on open/semi-open file, **proven color-symmetric** by test |
 | **Draws** | Threefold repetition, fifty-move rule, insufficient material |
 | **Notation / I/O** | SAN render & parse, PGN import/export (comments/NAGs/variations tolerated), **UCI** protocol, small opening book |
-| **App** | Interactive colored terminal UI, login/registration, Human-vs-Engine / Human-vs-Human / Engine-vs-Engine / Analysis modes, hints, undo/redo, PGN save/load, perft & eval commands |
+| **App** | Interactive colored terminal UI, login/registration, Human-vs-Engine / Human-vs-Human / Engine-vs-Engine / Analysis modes, hints, undo/redo, PGN save/load, FEN position setup, board flip & display toggles, perft / eval / search-stats commands |
 | **Quality** | 100+ unit/integration tests, perft suite (to 119M+ nodes), tactical suite, random-game invariant fuzzing, criterion benchmarks, leveled logging + search telemetry |
 
 ## Architecture
@@ -92,8 +92,19 @@ cargo run --release -- bench 9
 ```
 
 Inside the interactive app you can type moves in either **UCI** (`e2e4`,
-`e7e8q`) or **SAN** (`Nf3`, `O-O`, `exd5`), plus commands like `undo`, `redo`,
-`hint`, `analyze`, `eval`, `fen`, `flip`, `save`, and `perft`.
+`e7e8q`) or **SAN** (`Nf3`, `O-O`, `exd5`). Every in-game prompt (all game
+modes and analysis mode) also accepts:
+
+| Command | Effect |
+| --- | --- |
+| `undo` / `redo` | Take back / replay moves (vs engine: whole move pairs) |
+| `hint` | Engine move suggestion |
+| `analyze [depth]`, `go depth <n>`, `go time <ms>` | Position analysis (score, nodes, NPS, PV) |
+| `eval`, `stats`, `hash`, `perft <d>` | Static eval, last-search telemetry, Zobrist key, perft |
+| `save [file]`, `load [file]`, `pgn`, `fen` | PGN save/load (lists available saves), PGN/FEN display |
+| `position fen <FEN>` / `position startpos` | Set up a position |
+| `flip`, `coords on\|off`, `unicode on\|off` | Board display toggles |
+| `new`, `resign`, `menu`, `help` | Game flow & the full help screen |
 
 ## Correctness: perft
 
@@ -153,6 +164,7 @@ under-promotion, the draw rules, FEN robustness).
 | `search` | Iterative-deepening PVS, TT, pruning, ordering |
 | `transposition`, `zobrist` | Hashing infrastructure |
 | `san`, `pgn` | Notation rendering & parsing |
+| `epd` | EPD parsing (test-suite positions) |
 | `uci` | UCI protocol front end |
 | `book`, `timeman` | Opening book & time management |
 | `game` | High-level game API (play/undo/redo/status/PGN) |
